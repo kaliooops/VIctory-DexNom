@@ -696,9 +696,10 @@ impl Host {
 }
 
 /// Whether the host device is the software adapter (WARP): diagnostics
-/// builds with `VICTORY_D3D12_WARP`.
+/// builds with `VICTORY_D3D12_WARP` set to a nonempty value other than 0.
 pub(crate) fn on_warp() -> bool {
-    cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some()
+    cfg!(feature = "diagnostics")
+        && std::env::var_os("VICTORY_D3D12_WARP").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
@@ -6691,8 +6692,8 @@ struct Meter {
     cpu_us: u64,
     /// Percent of the machine's CPU over the last report.
     cpu_pct: f64,
-    /// Percent of the frame time the GPU was busy.
-    gpu_pct: f64,
+    /// Queue wait time as a percentage of frame time.
+    gpu_wait_pct: f64,
     /// Working set in MB.
     ram_mb: f64,
 }
@@ -6709,7 +6710,7 @@ impl Meter {
             logged: now,
             cpu_us: process_cpu_us().unwrap_or(0),
             cpu_pct: 0.0,
-            gpu_pct: 0.0,
+            gpu_wait_pct: 0.0,
             ram_mb: 0.0,
         }
     }
@@ -6739,7 +6740,7 @@ impl Meter {
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
-        // Process CPU share of the whole machine, GPU busy share of the frame,
+        // Process CPU share of the whole machine, GPU wait share of the frame,
         // and the process's working set.
         self.cpu_pct = {
             let now = process_cpu_us().unwrap_or(self.cpu_us);
@@ -6751,7 +6752,7 @@ impl Meter {
             self.cpu_us = now;
             pct
         };
-        self.gpu_pct = if ms > 0.0 { gpu / ms * 100.0 } else { 0.0 };
+        self.gpu_wait_pct = if ms > 0.0 { gpu / ms * 100.0 } else { 0.0 };
         self.ram_mb = process_working_set().unwrap_or(0) as f64 / (1024.0 * 1024.0);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
@@ -6902,13 +6903,13 @@ impl Meter {
             }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
-                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
+                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} GPU wait; \
+                 {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}; \
-                 cpu {cpu_pct:.1}% gpu {gpu_pct:.0}% busy ram {ram_mb:.0} MB",
+                 cpu {cpu_pct:.1}% GPU wait {gpu_wait_pct:.0}% ram {ram_mb:.0} MB",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
@@ -6929,7 +6930,7 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 cpu_pct = self.cpu_pct,
-                gpu_pct = self.gpu_pct,
+                gpu_wait_pct = self.gpu_wait_pct,
                 ram_mb = self.ram_mb
             );
             #[cfg(feature = "diagnostics")]
@@ -6943,12 +6944,12 @@ impl Meter {
                 }
             }
         }
-        let (cpu_pct, gpu_pct, ram_mb) = (self.cpu_pct, self.gpu_pct, self.ram_mb);
+        let (cpu_pct, gpu_wait_pct, ram_mb) = (self.cpu_pct, self.gpu_wait_pct, self.ram_mb);
         crate::debug_hud::update(hwnd, || {
             format!("DexNom Runtime diagnostics\n{fps:.1} FPS   {ms:.1} ms/frame   {draws:.0} draws/frame\nGPU wait {gpu:.1} ms   CPU prep {cpu:.1} ms   Copy-back {back_ms:.1} ms\nDropped {dropped:.0}/frame   RAM {ram_mb:.0} MB")
         });
         let text = format!(
-            "DexNom Runtime | {fps:.0} fps {ms:.1} ms/frame | gpu {gpu_pct:.0}% busy \
+            "DexNom Runtime | {fps:.0} fps {ms:.1} ms/frame | GPU wait {gpu_wait_pct:.0}% \
              cpu {cpu_pct:.0}% ram {ram_mb:.0} MB | {draws:.0} draws/frame"
         );
         // Setting the text waits for the window's thread (a title thread,
