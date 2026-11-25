@@ -391,9 +391,10 @@ struct Waiting {
     /// Which write of the queue put it here: the pass hands it back with
     /// what it did, so a slot written again meanwhile stays as written.
     write: u64,
-    /// Looks in a row that found nothing to upload (its memory not mapped,
-    /// or no more of it than at the last upload).
+    /// Consecutive deferrals, used to back off retries.
     looks: u8,
+    /// The last attempt could not use an existing GPU allocation under pressure.
+    waiting_for_room: bool,
     /// Bytes of its memory that were mapped when it was last uploaded
     /// without all of it there; 0: not uploaded yet.
     mapped: u64,
@@ -495,7 +496,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         self.rechecks.remove(&index);
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, recording: None });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, waiting_for_room: false, mapped: 0, recording: None });
     }
 
     fn remove(&mut self, index: u32) {
@@ -555,33 +556,35 @@ impl TextureQueue {
     /// backlog of unmapped or partial textures cannot use the whole pass.
     /// Among first looks, take the newest and oldest writes in turns.
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again = Vec::new();
-        let mut fresh = Vec::new();
+        self.due_ordered(frame, max, false)
+    }
+
+    fn due_ordered(&self, frame: u64, max: usize, pressure: bool) -> Vec<(u32, u64)> {
+        let mut fresh = [Vec::new(), Vec::new()];
+        let mut retries = [Vec::new(), Vec::new()];
         let now = crate::host::now_ms();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.ready(frame, now)) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((index, w.write));
+            let lane = usize::from(pressure && w.waiting_for_room);
+            let class = if w.looks > 0 || w.mapped > 0 { &mut retries } else { &mut fresh };
+            class[lane].push((index, w.write));
         }
-        again.sort_unstable_by_key(|&(_, write)| write);
-        fresh.sort_unstable_by_key(|&(_, write)| write);
-        let count = max.min(again.len() + fresh.len());
-        let mut fresh = fresh.into_iter();
-        // A time-limited pass may stop after one slot. Rotate its first
-        // choice across frames as well as rotating within each pass.
-        let mut retry = frame & 1 == 0;
-        let mut newest = again.is_empty() || frame & 2 == 0;
-        let mut order = Vec::with_capacity(count);
-        while order.len() < count {
-            if !again.is_empty() && (retry || fresh.len() == 0) {
-                order.push(again.pop().unwrap());
-            } else {
-                let next = if newest { fresh.next_back() } else { fresh.next() };
-                order.push(next.unwrap());
-                newest = !newest;
-            }
-            retry = !retry;
-        }
-        order
+        let [normal_fresh, blocked_fresh] = fresh;
+        let [normal_retry, blocked_retry] = retries;
+        let count = max.min(normal_fresh.len() + normal_retry.len() + blocked_fresh.len() + blocked_retry.len());
+        let mut normal = texture_slot_order(frame, normal_fresh, normal_retry);
+        let mut blocked = texture_slot_order(frame, blocked_fresh, blocked_retry);
+        // Most attempts go to slots that have not failed the residency check.
+        // Keep probing the blocked ones: another view may have made them resident.
+        (0..count)
+            .map(|i| {
+                if frame.wrapping_add(i as u64) % 8 == 7 {
+                    blocked.next().or_else(|| normal.next())
+                } else {
+                    normal.next().or_else(|| blocked.next())
+                }
+                .unwrap()
+            })
+            .collect()
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -598,6 +601,7 @@ impl TextureQueue {
         let attempt = Arc::new(());
         // A list that is kept closed indefinitely cannot reserve the slot indefinitely.
         slot.recording = Some((Arc::downgrade(&attempt), now.saturating_add(RETRY_MS)));
+        slot.waiting_for_room = false;
         Some(attempt)
     }
 
@@ -610,10 +614,21 @@ impl TextureQueue {
 
     /// Nothing to upload at slot `index` now: looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
-    fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
+    fn later(&mut self, index: u32, write: u64, frame: u64, most: u64, waiting_for_room: bool) {
         if let Some(w) = self.same(index, write) {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
+            w.waiting_for_room = waiting_for_room;
+        }
+    }
+
+    /// The budget allows allocations again. Existing backoff for missing
+    /// source data or staging failures still applies.
+    fn video_memory_available(&mut self, frame: u64) {
+        for w in self.slots.values_mut().filter(|w| w.waiting_for_room) {
+            w.due = w.due.min(frame);
+            w.looks = 0;
+            w.waiting_for_room = false;
         }
     }
 
@@ -634,7 +649,7 @@ impl TextureQueue {
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
         self.rechecks.remove(&index);
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, recording: None });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, waiting_for_room: false, mapped: 0, recording: None });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -645,16 +660,17 @@ impl TextureQueue {
 
     /// For the frame line: slots in the queue; of them due at `frame`;
     /// waiting for their memory (looked at, never uploaded); uploaded in
-    /// part; and the frames the oldest due one has waited since its write.
-    fn census(&self, frame: u64) -> [u64; 5] {
-        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
+    /// part; the oldest due one's wait in frames; and those last deferred for GPU memory.
+    fn census(&self, frame: u64) -> [u64; 6] {
+        let mut c = [self.slots.len() as u64, 0, 0, 0, 0, 0];
         let now = crate::host::now_ms();
         for w in self.slots.values() {
             if w.mapped > 0 {
                 c[3] += 1;
-            } else if w.looks > 0 {
+            } else if w.looks > 0 && !w.waiting_for_room {
                 c[2] += 1;
             }
+            c[5] += u64::from(w.waiting_for_room);
             if w.ready(frame, now) {
                 c[1] += 1;
                 c[4] = c[4].max(frame.saturating_sub(w.written));
@@ -662,6 +678,30 @@ impl TextureQueue {
         }
         c
     }
+}
+
+fn texture_slot_order(
+    frame: u64,
+    mut fresh: Vec<(u32, u64)>,
+    mut retries: Vec<(u32, u64)>,
+) -> impl Iterator<Item = (u32, u64)> {
+    retries.sort_unstable_by_key(|&(_, write)| write);
+    fresh.sort_unstable_by_key(|&(_, write)| write);
+    let mut fresh = fresh.into_iter();
+    // A time-limited pass may stop after one slot. Rotate its first choice too.
+    let mut retry = frame & 1 == 0;
+    let mut newest = retries.is_empty() || frame & 2 == 0;
+    std::iter::from_fn(move || {
+        let slot = if !retries.is_empty() && (retry || fresh.len() == 0) {
+            retries.pop()
+        } else {
+            let next = if newest { fresh.next_back() } else { fresh.next() };
+            newest = !newest;
+            next
+        };
+        retry = !retry;
+        slot
+    })
 }
 
 /// Whether `view` is of a texture the title may fill itself: a texture it
@@ -1182,9 +1222,16 @@ impl HostHeap {
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
-    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 6]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        let due = if max == 0 {
+            Vec::new()
+        } else if self.texture_pressure.load(std::sync::atomic::Ordering::Relaxed) {
+            textures.due_ordered(frame, max, true)
+        } else {
+            textures.due(frame, max)
+        };
+        (due, textures.census(frame))
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -1267,9 +1314,13 @@ impl HostHeap {
     /// Nothing to upload at title slot `index` now (its memory is not
     /// mapped, or no more of it than before): looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
-    pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64) {
+    pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64, waiting_for_room: bool) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.later(index, write, frame, most);
+        // Another pass may have seen room on the card since this attempt began.
+        if waiting_for_room && !self.texture_pressure.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        textures.later(index, write, frame, most, waiting_for_room);
     }
 
     /// Bytes of title slot `index`'s memory that were mapped when it was
@@ -1686,8 +1737,10 @@ impl HostHeap {
     }
 
     pub(crate) fn set_texture_pressure(&self, full: bool) {
-        self.texture_pressure
-            .store(full, std::sync::atomic::Ordering::Relaxed);
+        let was_full = self.texture_pressure.swap(full, std::sync::atomic::Ordering::Relaxed);
+        if was_full && !full {
+            self.textures.lock().unwrap_or_else(|e| e.into_inner()).video_memory_available(crate::frame::current());
+        }
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -3584,7 +3637,7 @@ mod tests {
             q.written(index, 0, 0, false);
         }
         for (index, write) in q.due(0, 10) {
-            q.later(index, write, 0, 4);
+            q.later(index, write, 0, 4, false);
         }
         for index in 10..20 {
             q.written(index, 1, 1, false);
@@ -3633,6 +3686,45 @@ mod tests {
     }
 
     #[test]
+    fn vram_blocked_retries_do_not_hide_other_uploads_behind_the_refusal_limit() {
+        let mut queue = TextureQueue::default();
+        for index in 0..520 {
+            queue.written(index, 0, 0, false);
+            let write = queue.slots[&index].write;
+            queue.later(index, write, 0, 4, index >= 8);
+        }
+
+        assert!(queue.due(8, 257).iter().all(|&(index, _)| index >= 8));
+        let priority = queue.due_ordered(8, 257, true);
+        assert!(priority[..7].iter().all(|&(index, _)| index < 8));
+        assert!(priority[7].0 >= 8, "probe a blocked slot while other work is available");
+        assert!(priority[8].0 < 8);
+        assert!(queue.due_ordered(7, 1, true)[0].0 >= 8, "probe even in one-slot passes");
+        let census = queue.census(8);
+        assert_eq!(census[2], 8);
+        assert_eq!(census[5], 512);
+
+        queue.changed(519, 8, 8);
+        assert_eq!(queue.due_ordered(9, 1, true)[0].0, 519, "new data gets a fresh attempt");
+    }
+
+    #[test]
+    fn recovered_vram_budget_wakes_only_allocation_retries() {
+        let mut queue = TextureQueue::default();
+        for index in [1, 2] {
+            queue.written(index, 0, 0, false);
+            let write = queue.slots[&index].write;
+            for _ in 0..5 {
+                queue.later(index, write, 0, 16, index == 1);
+            }
+        }
+        assert!(queue.due(3, 8).is_empty());
+        queue.video_memory_available(3);
+        assert_eq!(queue.due(3, 8).iter().map(|&(slot, _)| slot).collect::<Vec<_>>(), [1]);
+        assert_eq!(queue.census(3)[5], 0);
+    }
+
+    #[test]
     fn indexed_texture_uploads_retry_held_lists_and_ignore_stale_submissions() {
         let queue = Arc::new(Mutex::new(TextureQueue::default()));
         let make_upload = |write, now| {
@@ -3672,13 +3764,13 @@ mod tests {
         // newest, oldest, newest, oldest, and so on
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
         assert_eq!(q.due(9, 2).len(), 2);
-        assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
+        assert_eq!(q.census(9), [9, 9, 0, 0, 8, 0]);
         // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
         let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
         let w17 = write(&q, 17);
         let mut frame = 9;
         for wait in [1, 2, 4, 4] {
-            q.later(17, w17, frame, 4);
+            q.later(17, w17, frame, 4, false);
             assert!(!q.due(frame + wait - 1, 100).iter().any(|d| d.0 == 17));
             frame += wait;
             // Due again; these even frames start with a retry.
@@ -3696,7 +3788,7 @@ mod tests {
         // the pass then says about the old write changes nothing.
         q.written(16, 13, 0, false);
         q.done(16, w16);
-        q.later(16, w16, 13, 4);
+        q.later(16, w16, 13, 4, false);
         assert_eq!(q.mapped(16), 0);
         assert_eq!(q.due(13, 100)[0].0, 16);
         // A draw that makes the host slot (`seen`) keeps what the queue knows,

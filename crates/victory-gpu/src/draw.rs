@@ -453,8 +453,8 @@ pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
 /// The queue of textures picked by index at the last pass
 /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
-/// uploaded in part, and the frames the oldest due one has waited.
-pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// uploaded in part, the oldest due one's wait, and those last blocked by VRAM.
+pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// Since the start: looks at a slot uploaded in part that found no more of
 /// its memory mapped; uploads of textures not all mapped; and of those,
 /// the ones whose first page was not there (asked by the first page alone,
@@ -1916,13 +1916,13 @@ impl State {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
-                    host.texture_slot_later(index, write, frame, most);
+                    host.texture_slot_later(index, write, frame, most, false);
                     continue;
                 }
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
-                        host.texture_slot_later(index, write, frame, most);
+                        host.texture_slot_later(index, write, frame, most, false);
                         continue;
                     }
                     if !crate::texture::committed(address as *const u8, 1) {
@@ -1969,7 +1969,7 @@ impl State {
                 let Some((view, pin)) = upload else {
                     // Give ready uploads and unmapped slots behind this one
                     // their turn before retrying the blocked prefix.
-                    host.texture_slot_later(index, write, frame, most);
+                    host.texture_slot_later(index, write, frame, most, true);
                     refused += 1;
                     if refused > 256 {
                         break;
@@ -2012,7 +2012,7 @@ impl State {
             if let Some(view) = &view
                 && !readable(list, sampled.kind, view)
             {
-                host.texture_slot_later(index, write, frame, most);
+                host.texture_slot_later(index, write, frame, most, false);
                 continue;
             }
             // A texture view the host refuses removes the device: name it.
