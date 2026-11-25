@@ -1,9 +1,11 @@
 //! Presented frames written to PNG files, to see what reaches the screen:
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
-//! size. Only in builds with diagnostics.
+//! size. A file named `capture-now` in that folder requests a listed frame
+//! while the game is running. Only in builds with diagnostics.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -48,7 +50,25 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after)) || heavy_listed(n)
+    named
+        || n != 0 && ON_DEMAND.load(Ordering::Relaxed) == n
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+        || heavy_listed(n)
+}
+
+/// The pending listed frame for a `capture-now` request. Zero is never a
+/// presented frame. Capture one frame to limit target readbacks and stalls.
+static ON_DEMAND: AtomicU64 = AtomicU64::new(0);
+
+fn take_capture_request(folder: &Path, presented: u64, scheduled: &AtomicU64) -> Option<u64> {
+    // The next frame's lists may already be recording.
+    let target = presented.checked_add(2)?;
+    if scheduled.load(Ordering::Relaxed) >= presented {
+        return None;
+    }
+    std::fs::remove_file(folder.join("capture-now")).ok()?;
+    scheduled.store(target, Ordering::Relaxed);
+    Some(target)
 }
 
 /// `VICTORY_CAPTURE_HEAVY_FRAMES` (comma-separated): frames counted from
@@ -172,6 +192,11 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static LAST_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(folder) = folder()
+        && let Some(target) = take_capture_request(folder, frame, &ON_DEMAND)
+    {
+        tracing::info!(frame = target, "capture-now: frame scheduled");
+    }
     let attempted = crate::draw::attempted();
     let attempts = attempted.saturating_sub(LAST_ATTEMPTS.swap(attempted, Relaxed));
     let offsets = heavy_offsets();
@@ -1204,6 +1229,28 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn on_demand_capture_consumes_one_request_and_preserves_the_pending_frame() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let folder = tempfile::tempdir().unwrap();
+        let request = folder.path().join("capture-now");
+        let scheduled = AtomicU64::new(0);
+        let poll = |frame| super::take_capture_request(folder.path(), frame, &scheduled);
+        assert_eq!(poll(10), None);
+        std::fs::write(&request, []).unwrap();
+        assert_eq!(poll(11), Some(13));
+        assert!(!request.exists());
+        std::fs::write(&request, []).unwrap();
+        assert_eq!(poll(12), None);
+        assert_eq!(poll(13), None);
+        assert_eq!(scheduled.load(Ordering::Relaxed), 13);
+        assert!(request.is_file());
+        assert_eq!(poll(14), Some(16));
+        assert_eq!(poll(17), None);
+        assert_eq!(scheduled.load(Ordering::Relaxed), 16);
+    }
+
     #[test]
     fn sparse_input_selector_requires_an_exact_shader_and_table_binding() {
         let input = super::input_selector("DF11DCD012CD7382:s1+56").unwrap();
