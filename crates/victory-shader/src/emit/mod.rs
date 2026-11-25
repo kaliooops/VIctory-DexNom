@@ -509,6 +509,30 @@ pub fn emit(
                 }
             }
         }
+        // Only after all other forms fail, try the existing single-console-
+        // wave lowering. On a host capped at 32 lanes a 64-lane result
+        // cannot create a pipeline. Keeping the earlier choices avoids
+        // moving shaders that already run onto the group-barrier path.
+        if !wide_on
+            && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0")
+            && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+        {
+            let deep = if std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0") {
+                form(ir::without_skips(p, true))
+            } else {
+                None
+            };
+            let base = deep
+                .as_ref()
+                .or(forms[1].1.as_ref())
+                .or(forms[0].1.as_ref())
+                .map_or(p, |(p, _, _, _)| p);
+            let again = widen(c, native, base, why);
+            report("wave-wide branches (last resort)", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
