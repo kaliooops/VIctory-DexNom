@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
-use crate::host::HostList;
+use crate::host::{HeapRefresh, HostList};
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
@@ -1493,7 +1493,7 @@ impl State {
     /// its host slot and its memory brought up to date when `list` is
     /// submitted. Tables tell us which views a draw reads; nothing tells
     /// us which of the heap's a computed index names, so all of them are
-    /// made ready, once per list.
+    /// made ready by the first submitted list that uses the scan.
     /// shortcut: the buffers are read, not written: what such a shader
     /// writes through a picked unordered access view stays in the host
     /// copy. A list refreshes them where it first runs such a shader;
@@ -1522,10 +1522,12 @@ impl State {
         // of one frame is seen a frame late.
         let frame = crate::frame::current();
         let mut pass = host.buffer_pass.lock().unwrap_or_else(|e| e.into_inner());
-        if pass.frame == Some(frame) {
+        if let Some(refresh) = &pass.refresh
+            && refresh.frame() == frame
+        {
+            list.defer_heap_refresh(refresh.clone());
             return Some(gpu);
         }
-        pass.frame = Some(frame);
         let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
@@ -1578,7 +1580,10 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            let len = len.min(shadow.left(address));
+            if len != 0 {
+                ranges.insert(index, (shadow, address, address + len));
+            }
         }
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
@@ -1590,40 +1595,16 @@ impl State {
             span.1 = span.1.min(*from);
             span.2 = span.2.max(*to);
         }
-        drop(pass);
+        let copies = spans.len();
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
-        // Memory that is not write-watched is copied whole by every refresh.
-        // It was once refreshed only every 120 frames (unmapped pages read
-        // one by one cost 14 GB a frame in run 11, before they were
-        // remembered): streamed geometry then drew from stale buffers, and
-        // the garbage ended runs (the card stopped answering 14-90 frames
-        // into the opening cutscene; with every frame it ran on). The pass
-        // costs some 30 ms a frame this way.
-        static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
-        let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
-        let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
-            if shadow.unwatched() {
-                // By the copy's number: a copy made where one let go was
-                // (`shadow::let_go_idle`) has never been refreshed.
-                let key = shadow.id() as usize;
-                // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
-                static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-                let every = *EVERY.get_or_init(|| {
-                    std::env::var("VICTORY_UNWATCHED_FRAMES")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1)
-                });
-                match whole.get(&key) {
-                    Some(&last) if frame < last + every => continue,
-                    _ => {
-                        whole.insert(key, frame);
-                    }
-                }
-            }
-            shadow.refresh(list, *from, to - from);
-        }
+        let ranges = spans
+            .into_values()
+            .map(|(shadow, from, to)| (shadow, from as usize, (to - from) as usize))
+            .collect();
+        let refresh = std::sync::Arc::new(HeapRefresh::new(frame, ranges));
+        pass.refresh = Some(refresh.clone());
+        drop(pass);
+        list.defer_heap_refresh(refresh);
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1635,7 +1616,7 @@ impl State {
             tracing::info!(
                 slots = slots.len(),
                 views,
-                copies = spans.len(),
+                copies,
                 mb = bytes >> 20,
                 ms = started.elapsed().as_millis(),
                 "buffer views of the heap made ready for shaders that pick them by index"
@@ -3787,6 +3768,82 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_heap_reads_follow_submission_order() {
+        use windows::core::IUnknown;
+
+        let Some(host) = crate::host::host() else {
+            assert!(!crate::host::on_warp(), "WARP device unavailable");
+            return;
+        };
+        #[repr(C)]
+        struct HeapArgs(D3D12_DESCRIPTOR_HEAP_DESC, [u64; 2]);
+        let args = HeapArgs(
+            D3D12_DESCRIPTOR_HEAP_DESC {
+                NumDescriptors: 16,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                ..Default::default()
+            },
+            [0; 2],
+        );
+        let mut object = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                std::ptr::from_ref(&args).cast(),
+                &crate::resource::PAGEABLE_IIDS[0],
+                &mut object,
+            ),
+            0
+        );
+        let _owner = unsafe { IUnknown::from_raw(object.cast_mut().cast()) };
+        let heap = crate::descriptor::heap(object);
+
+        #[repr(align(256))]
+        struct TitleBuffer([u8; 256]);
+        let mut title = Box::new(TitleBuffer([0x31; 256]));
+        let address = title.0.as_ptr() as u64;
+        let len = title.0.len() as u64;
+        crate::shadow::register(address as usize, address, len);
+        let shadow = crate::shadow::find(address, len).unwrap();
+        let mut resource = [0; 14];
+        resource[0] = 1; // Buffer dimension
+        resource[4] = len as u32;
+        let mut view = [0; 16];
+        view[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT.0 as u32;
+        view[1] = 1;
+        view[6] = (len / 4) as u32;
+        view[10] = address as u32;
+        view[11] = (address >> 32) as u32;
+        crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &view, heap.handle(0).unwrap());
+
+        let mut state = State::default();
+        state.set_heaps(&[object]);
+        let recorded_first = host.new_list().unwrap();
+        let submitted_first = host.new_list().unwrap();
+        assert!(state.heap_buffers(&recorded_first).is_some());
+        assert!(state.heap_buffers(&submitted_first).is_some());
+        let readback = host.read_back_buffer(len).unwrap();
+        // The GPU reads the very same host buffer the indexed view names.
+        unsafe {
+            submitted_first.list.CopyBufferRegion(&readback, 0, &shadow.buffer, shadow.offset(address), len);
+        }
+        recorded_first.close();
+        submitted_first.close();
+
+        title.0.fill(0x72);
+        host.execute(&[&submitted_first]);
+        let mut bytes = std::ptr::null_mut();
+        let matches = unsafe {
+            readback.Map(0, None, Some(&mut bytes)).unwrap();
+            let matches = std::slice::from_raw_parts(bytes.cast::<u8>(), len as usize) == title.0.as_slice();
+            readback.Unmap(0, None);
+            matches
+        };
+        crate::shadow::unregister(address as usize, address);
+        assert!(matches, "the GPU read stale bytes before the first recorded list submitted");
+    }
 
     #[test]
     fn thread_dimensions_use_the_kernels_declared_group_size() {

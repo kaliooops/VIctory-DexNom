@@ -6,8 +6,8 @@
 //! overlap them with per-submission fences once more than clears run.
 
 use std::time::{Duration, Instant};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -1756,6 +1756,27 @@ struct CardPlan {
     lists: Vec<(bool, Prelude)>,
 }
 
+type RefreshRange = (Arc<crate::shadow::Shadow>, usize, usize);
+
+/// Buffer ranges shared by lists that use the same indexed-heap scan.
+/// The submission lock serializes preparation, and the first list submitted
+/// with the plan queues its refreshes. A later frame may replay the plan.
+pub(crate) struct HeapRefresh {
+    frame: u64,
+    ranges: Vec<RefreshRange>,
+    submitted_frame: AtomicU64,
+}
+
+impl HeapRefresh {
+    pub(crate) fn new(frame: u64, ranges: Vec<RefreshRange>) -> Self {
+        Self { frame, ranges, submitted_frame: AtomicU64::new(u64::MAX) }
+    }
+
+    pub(crate) fn frame(&self) -> u64 {
+        self.frame
+    }
+}
+
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
@@ -1767,7 +1788,8 @@ enum Step {
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
-    Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    Refresh(RefreshRange),
+    HeapRefresh(Arc<HeapRefresh>),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
@@ -2331,6 +2353,13 @@ impl PendingWrites {
         touches(&self.buffers, start, end) || touches(&self.textures, start, end)
     }
 
+    /// Buffer-shadow flights have their own merge logic. A stale or partial
+    /// snapshot and a texture still waiting for CPU tiling both block reads.
+    fn blocks_buffer(&self, start: usize, end: usize) -> bool {
+        crate::writeback::needs_new_snapshot(start, end, &self.buffers)
+            || touches(&self.textures, start, end)
+    }
+
     fn add(&mut self, back: &[Declared], textures: &[(usize, usize)]) {
         if !back.is_empty() {
             join_ranges(&mut self.buffers, back.iter().flat_map(|(_, r)| r.iter().copied()));
@@ -2343,13 +2372,13 @@ impl PendingWrites {
 
 /// The first list whose CPU preparation would read a texture that an
 /// earlier list in this same batch still needs to publish.
-fn texture_dependency_cut(runs: &[&HostList]) -> Option<usize> {
+fn texture_dependency_cut(runs: &[&HostList], frame: u64) -> Option<usize> {
     if runs.len() < 2 {
         return None;
     }
     let mut pending = PendingWrites::default();
     for (index, list) in runs.iter().enumerate() {
-        if !pending.is_empty() && blocked_by(&pending, std::slice::from_ref(list), false).is_some() {
+        if !pending.is_empty() && blocked_by(&pending, std::slice::from_ref(list), frame, false).is_some() {
             return Some(index);
         }
         if index + 1 < runs.len() {
@@ -2378,7 +2407,7 @@ fn flying() -> bool {
 /// CPU (the title's buffer copies, fills of upload memory, textures) and
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
-fn late_blocked(runs: &[&HostList]) -> Option<usize> {
+fn late_blocked(runs: &[&HostList], frame: u64) -> Option<usize> {
     let written = {
         let line = line();
         if line.written.is_empty() {
@@ -2386,16 +2415,17 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         line.written.clone()
     };
-    blocked_by(&written, runs, true)
+    blocked_by(&written, runs, frame, true)
 }
 
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
-fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool) -> Option<usize> {
+fn blocked_by(written: &PendingWrites, runs: &[&HostList], frame: u64, count: bool) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
+    let mut seen = std::collections::HashSet::new();
     for list in runs {
         for step in &list.deferred().copies {
             match step {
@@ -2425,14 +2455,13 @@ fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool) -> Optio
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                // Buffer-shadow flights have their own merge logic. A texture
-                // lands through CPU tiling and can supply bytes to refresh or
-                // to the before-image of a later partial buffer write.
-                Step::Refresh(_, at, len) | Step::GpuWrite(_, at, len) => {
-                    if crate::writeback::needs_new_snapshot(*at, at + len, &written.buffers) {
+                Step::Refresh(_) | Step::HeapRefresh(_) => {
+                    if step.refreshes(frame, &mut seen).any(|(_, at, len)| written.blocks_buffer(*at, at + len)) {
                         return Some(WHY_READ);
                     }
-                    if touches(&written.textures, *at, at + len) {
+                }
+                Step::GpuWrite(_, at, len) => {
+                    if written.blocks_buffer(*at, at + len) {
                         return Some(WHY_READ);
                     }
                 }
@@ -2448,16 +2477,14 @@ fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool) -> Optio
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> bool {
-    use std::sync::Arc;
+fn stale_under_flights(runs: &[&HostList], frame: u64) -> bool {
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step
-                && shadow.writes_pending()
-            {
+            for (shadow, address, len) in step.refreshes(frame, &mut seen).filter(|(shadow, _, _)| shadow.writes_pending()) {
                 match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
                     Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
                     None => spans.push((shadow.clone(), *address, *address + *len)),
@@ -4476,15 +4503,16 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let frame = crate::frame::current();
         let mut already_run = 0;
-        while let Some(cut) = texture_dependency_cut(runs) {
-            (submitted, _) = self.submit_part(&runs[..cut], false, submitted, #[cfg(feature = "diagnostics")] called);
+        while let Some(cut) = texture_dependency_cut(runs, frame) {
+            (submitted, _) = self.submit_part(&runs[..cut], false, frame, submitted, #[cfg(feature = "diagnostics")] called);
             already_run += cut;
             runs = &runs[cut..];
             #[cfg(feature = "diagnostics")]
             { called = std::time::Instant::now(); }
         }
-        let (submitted, sent) = self.submit_part(runs, late, submitted, #[cfg(feature = "diagnostics")] called);
+        let (submitted, sent) = self.submit_part(runs, late, frame, submitted, #[cfg(feature = "diagnostics")] called);
         sent.map(|sent| (submitted, sent, already_run))
     }
 
@@ -4494,6 +4522,7 @@ impl Host {
         &'a self,
         runs: &[&HostList],
         late: bool,
+        frame: u64,
         mut submitted: std::sync::MutexGuard<'a, u64>,
         #[cfg(feature = "diagnostics")] called: std::time::Instant,
     ) -> (std::sync::MutexGuard<'a, u64>, Option<Sent>) {
@@ -4509,11 +4538,11 @@ impl Host {
         // what they write.
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if let Some(why) = late_blocked(runs) {
+        } else if let Some(why) = late_blocked(runs, frame) {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                relay_wait(why, |line| blocked_by(&line.written, runs, frame, false).is_none());
             } else {
                 self.settle(&mut submitted, why);
             }
@@ -4558,11 +4587,10 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            let mut seen = std::collections::HashSet::new();
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
+                    for (shadow, address, len) in step.refreshes(frame, &mut seen).filter(|(shadow, _, _)| !shadow.unwatched()) {
                         let span = spans
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
                             .or_insert((*address, *address + *len));
@@ -4576,13 +4604,13 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && stale_under_flights(runs, frame) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && stale_under_flights(runs, frame) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
@@ -4590,7 +4618,7 @@ impl Host {
         let parallel = parallel_preludes(runs);
         let mut plans = Vec::new();
         for list in runs {
-            list.run_deferred(&mut batch);
+            list.run_deferred(&mut batch, frame);
             firsts.push(lists.len());
             if let Some(plan) = list.plan_prelude() {
                 lists.push(plan.commands.1.cast().ok());
@@ -5630,8 +5658,12 @@ impl HostList {
         if deferred.refreshed.insert(key) {
             deferred
                 .copies
-                .push(Step::Refresh(shadow.clone(), address, len));
+                .push(Step::Refresh((shadow.clone(), address, len)));
         }
+    }
+
+    pub(crate) fn defer_heap_refresh(&self, refresh: Arc<HeapRefresh>) {
+        self.deferred().copies.push(Step::HeapRefresh(refresh));
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
@@ -5834,7 +5866,7 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    fn run_deferred(&self, batch: &mut Batch, frame: u64) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -5868,13 +5900,19 @@ impl HostList {
                     let _ = jobs;
                     bytes
                 }
-                Step::Refresh(shadow, address, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Refreshes, 1);
-                        add(C::RefreshBytes, *len as u64);
-                    }
+                Step::Refresh((shadow, address, len)) => {
                     batch.add(shadow, *address, *len);
+                    continue;
+                }
+                Step::HeapRefresh(plan) => {
+                    if plan.submitted_frame.load(Ordering::Relaxed) != frame {
+                        plan.submitted_frame.store(frame, Ordering::Relaxed);
+                        for (shadow, address, len) in &plan.ranges {
+                            if shadow.take_heap_refresh(frame) {
+                                batch.add(shadow, *address, *len);
+                            }
+                        }
+                    }
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
@@ -5950,6 +5988,25 @@ impl Fill {
 }
 
 impl Step {
+    /// Inspect future refreshes without claiming them. Repeated uses of an
+    /// indexed heap share both the refresh and its dependency checks.
+    fn refreshes(
+        &self,
+        frame: u64,
+        seen: &mut std::collections::HashSet<*const HeapRefresh>,
+    ) -> impl Iterator<Item = &RefreshRange> {
+        let (ranges, heap) = match self {
+            Self::Refresh(range) => (std::slice::from_ref(range), false),
+            Self::HeapRefresh(plan)
+                if plan.submitted_frame.load(Ordering::Relaxed) != frame && seen.insert(Arc::as_ptr(plan)) =>
+            {
+                (&plan.ranges[..], true)
+            }
+            _ => (&[][..], false),
+        };
+        ranges.iter().filter(move |(shadow, _, _)| !heap || shadow.heap_refresh_due(frame))
+    }
+
     fn fills(&self) -> &[Fill] {
         match self {
             Self::Fill(fill) => std::slice::from_ref(fill),
@@ -6097,7 +6154,7 @@ mod fill_tests {
             buffers: vec![(last_byte, last_byte + 1)],
             textures: Vec::new(),
         };
-        assert_eq!(blocked_by(&pending, &[&list], false), Some(WHY_READ));
+        assert_eq!(blocked_by(&pending, &[&list], crate::frame::current(), false), Some(WHY_READ));
         list.defer_copy(source.as_mut_ptr(), next.as_ptr(), 512);
         for fill in fills(&source, &mut after, 1) {
             list.deferred().append_fill(fill, 4);
@@ -6157,6 +6214,12 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Refreshes, 1);
+            add(C::RefreshBytes, len as u64);
+        }
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
@@ -7606,8 +7669,39 @@ mod spare {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, HeapRefresh, PendingWrites, WHY_READ, blocked_by, host};
     use std::sync::Arc;
+
+    #[test]
+    fn indexed_heap_refresh_participates_in_submission_dependency_checks() {
+        let Some(host) = host() else {
+            assert!(!super::on_warp(), "WARP device unavailable");
+            return;
+        };
+        let title = Box::new([0u8; 256]);
+        let address = title.as_ptr() as usize;
+        crate::shadow::register(address, address as u64, title.len() as u64);
+        let shadow = crate::shadow::find(address as u64, title.len() as u64).unwrap();
+        let plan = Arc::new(HeapRefresh::new(7, vec![(shadow, address, title.len())]));
+        let recorded_first = host.new_list().unwrap();
+        let submitted_first = host.new_list().unwrap();
+        recorded_first.defer_heap_refresh(plan.clone());
+        submitted_first.defer_heap_refresh(plan);
+        let written = PendingWrites { buffers: vec![], textures: vec![(address, address + title.len())] };
+
+        assert_eq!(blocked_by(&written, &[&submitted_first], 7, false), Some(WHY_READ));
+        let mut first = Batch::default();
+        submitted_first.run_deferred(&mut first, 7);
+        assert_eq!(first.refreshes.len(), 1);
+        assert_eq!(blocked_by(&written, &[&recorded_first], 7, false), None);
+        let mut next = Batch::default();
+        recorded_first.run_deferred(&mut next, 7);
+        assert!(next.refreshes.is_empty());
+        assert_eq!(blocked_by(&written, &[&submitted_first], 8, false), Some(WHY_READ));
+        submitted_first.run_deferred(&mut next, 8);
+        assert_eq!(next.refreshes.len(), 1);
+        crate::shadow::unregister(address, address as u64);
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {

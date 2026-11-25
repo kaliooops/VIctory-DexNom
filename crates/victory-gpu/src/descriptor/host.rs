@@ -115,7 +115,7 @@ struct BufferSlots {
 /// Refresh ranges belong to the heap that owns the corresponding slots.
 #[derive(Default)]
 pub(crate) struct BufferPass {
-    pub(crate) frame: Option<u64>,
+    pub(crate) refresh: Option<Arc<crate::host::HeapRefresh>>,
     pub(crate) passes: u64,
     pub(crate) ranges: std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
 }
