@@ -41,8 +41,9 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Guest mips per array slice and the first represented on the host.
     mips: u32,
+    base_mip: u32,
     /// The first of them that is uploaded, and the bytes of title memory
     /// read for it and the smaller ones.
     first: u32,
@@ -691,7 +692,7 @@ impl Staging {
     /// The texture's subresource the `i`th part of the staging buffer is.
     fn subresource(&self, i: usize) -> u32 {
         let (mip, slice) = self.part(i);
-        slice * self.mips + mip
+        slice * (self.mips - self.base_mip) + mip - self.base_mip
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
@@ -1262,11 +1263,14 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    let (first, size) = staged_part(&layout, u32::from(d.MipLevels), first);
+    let base_mip = crate::resource::texture_base_mip(resource);
+    let mips = u32::from(d.MipLevels) + base_mip;
+    let (first, size) = staged_part(&layout, mips, first);
+    let first = first.max(base_mip);
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
-        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize) - first
+        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize) - (first - base_mip)
     };
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
@@ -1275,7 +1279,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     unsafe {
         host.device.GetCopyableFootprints(
             &d,
-            first,
+            first - base_mip,
             count,
             0,
             Some(footprints.as_mut_ptr()),
@@ -1302,7 +1306,8 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         footprints,
         rows,
         layout,
-        mips: u32::from(d.MipLevels),
+        mips,
+        base_mip,
         first,
         size,
         bytes: total,

@@ -1731,7 +1731,8 @@ impl State {
             let state = match heap.handle(index).and_then(crate::descriptor::view) {
                 Some(View::Placed(false, resource, desc)) if resource[0] != 1 => {
                     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                    match crate::resource::placed_known(address, &resource) {
+                    let base_mip = crate::resource::placed_sample_base(&resource, &desc);
+                    match crate::resource::placed_known(address, &resource, base_mip) {
                         Some(texture) => crate::resource::copy_state(texture),
                         // No title texture was made for it: the pass never
                         // got as far as making one.
@@ -3512,6 +3513,10 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) -> bool {
     const UNORDERED_ACCESS: u32 = 0x8;
+    let first = match view {
+        View::Placed(false, _, desc) => crate::resource::first_mip(desc),
+        _ => 0,
+    };
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().map_or(view, |p| &p.view);
     // Buffer views read title memory: their range is copied at submission;
@@ -3545,10 +3550,6 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) -> bool {
                 && crate::texture::title_written(t)
             {
                 // Of a texture the title placed, the mips the view shows.
-                let first = match (&placed, view) {
-                    (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
-                    _ => 0,
-                };
                 prepared = crate::texture::upload_from(list, *resource as This, t, first);
             }
             // A depth texture shaders also write: what they wrote, first.
@@ -3672,7 +3673,8 @@ fn view_state(view: Option<&View>) -> String {
         None => "no view".into(),
         Some(View::Placed(false, r, d)) if r[0] != 1 => {
             let address = u64::from(d[10]) | u64::from(d[11]) << 32;
-            let state = match crate::resource::placed_known(address, r) {
+            let base_mip = crate::resource::placed_sample_base(r, d);
+            let state = match crate::resource::placed_known(address, r, base_mip) {
                 Some(this) => texture_state(this),
                 None => format!(
                     "{}x{} f{} levels={} resource=none {}",

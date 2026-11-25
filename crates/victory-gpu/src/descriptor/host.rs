@@ -3051,7 +3051,8 @@ fn resident_sampled_texture(view: &View) -> Option<crate::resource::ResidentText
         // Writable allocations may have a different current owner.
         View::Placed(false, resource, desc) if resource[0] != 1 && resource[12] & 7 == 0 => {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            crate::resource::placed_known(address, resource)?
+            let base_mip = crate::resource::placed_sample_base(resource, desc);
+            crate::resource::placed_known(address, resource, base_mip)?
         }
         _ => return None,
     };
@@ -3079,17 +3080,18 @@ pub(crate) fn placed_texture(view: &View) -> Option<PlacedTexture> {
     } else {
         None
     };
+    let base_mip = if *unordered { 0 } else { crate::resource::placed_sample_base(resource, desc) };
     let texture = match &owner {
         Some(owner) => owner.as_ptr(),
         None if *unordered => return None,
-        // Read-only reinterpretations retain the existing placed SRV path.
-        None => crate::resource::texture_at(address, resource)?,
+        None => crate::resource::placed_at(address, resource, base_mip)?,
     };
-    let words = desc[..10].try_into().ok();
+    let mut words: [u32; 10] = desc[..10].try_into().unwrap();
     let view = if *unordered {
-        View::Unordered(texture as usize, 0, words)
+        View::Unordered(texture as usize, 0, Some(words))
     } else {
-        View::Shader(texture as usize, words)
+        words[4] -= base_mip;
+        View::Shader(texture as usize, Some(words))
     };
     Some(PlacedTexture {
         view,
@@ -4099,8 +4101,8 @@ mod tests {
         desc[10] = address as u32;
         desc[11] = (address >> 32) as u32;
         assert!(resident_sampled_texture(&View::Placed(false, resource, desc)).is_none());
-        assert!(crate::resource::placed_known(address, &resource).is_none());
-        let texture = crate::resource::texture_at(address, &resource).unwrap();
+        assert!(crate::resource::placed_known(address, &resource, 0).is_none());
+        let texture = crate::resource::placed_at(address, &resource, 0).unwrap();
         let heap = HostHeap::new(false, 4).unwrap();
         let record = |view: View| {
             let [index, generation] = super::super::words_for(view);
@@ -4124,7 +4126,7 @@ mod tests {
             heap.mirror_resident(2, unavailable.as_ptr() as u64)
                 .is_err()
         );
-        assert!(crate::resource::placed_known(address, &other).is_none());
+        assert!(crate::resource::placed_known(address, &other, 0).is_none());
         assert!(device_removed().is_none());
     }
 
@@ -4155,7 +4157,7 @@ mod tests {
             );
         };
         mirror(&original, true);
-        let texture = crate::resource::placed_known(address, &resource).unwrap();
+        let texture = crate::resource::placed_known(address, &resource, 0).unwrap();
         let backing = crate::resource::host_resource(texture).unwrap().clone();
         assert_eq!(heap.shows(2, &backing), Some(true));
 

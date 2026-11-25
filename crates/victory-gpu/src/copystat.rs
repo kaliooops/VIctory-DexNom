@@ -743,6 +743,13 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    let [compact, compact_bytes] = crate::resource::COMPACT_TEXTURES.each_ref().map(|v| v.load(Relaxed));
+    if compact != 0 {
+        tracing::info!(
+            "memory of compact texture copies: {compact} alive {:.1} MB",
+            mb(compact_bytes),
+        );
+    }
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \

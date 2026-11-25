@@ -1088,7 +1088,7 @@ enum Backing {
     Address(*mut u8),
     /// A resource synthesized from a view, without a title resource object.
     #[cfg(windows)]
-    ViewAddress(*mut u8),
+    ViewAddress { at: *mut u8, base_mip: u32 },
 }
 
 impl Drop for Backing {
@@ -1128,6 +1128,7 @@ pub(crate) struct HostTexture {
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
+    compact: bool,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1168,6 +1169,11 @@ struct Hosted {
 pub(crate) static KINDS: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
+/// Live compact texture copies and their host allocation bytes.
+#[cfg(windows)]
+pub(crate) static COMPACT_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Every title texture alive (not buffers), by address: for the sweep and
 /// the memory line. A texture leaves the table before it is freed.
 #[cfg(windows)]
@@ -1188,7 +1194,7 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// For `this`, a texture made for a view the title placed in memory
-/// ([`texture_at`]): the title texture the host writes that lies in the
+/// ([`placed_at`]): the title texture the host writes that lies in the
 /// same memory, if there is one of the same size, levels and layers with
 /// texels of the same width. The console reads such a texture through the
 /// view as it is
@@ -1306,7 +1312,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+        let base_mip = texture_base_mip(this);
+        let mut gpu_desc = r.desc;
+        gpu_desc.width >>= base_mip;
+        gpu_desc.height >>= base_mip;
+        gpu_desc.mip_levels -= base_mip as u16;
+        let Some(texture) = host_texture(&gpu_desc, r.host.state, clear) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1325,6 +1336,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = HostTexture::new(texture, state);
         host.filled = fills(&r.desc);
+        host.compact = base_mip != 0;
+        if host.compact {
+            COMPACT_TEXTURES[0].fetch_add(1, Relaxed);
+            COMPACT_TEXTURES[1].fetch_add(host.bytes, Relaxed);
+        }
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
             KINDS[1].fetch_add(host.bytes, Relaxed);
@@ -1405,12 +1421,12 @@ fn room_percent() -> u64 {
     })
 }
 
-/// Finds an existing placed texture using the same key as `texture_at`.
+/// Finds an existing placed texture using the same key as `placed_at`.
 #[cfg(windows)]
-pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
+pub(crate) fn placed_known(address: u64, desc: &[u32; 14], base_mip: u32) -> Option<This> {
     let key = placed_key(*desc);
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    map.get(&(address, key)).map(|&resource| resource as This)
+    map.get(&(address, key, base_mip)).map(|&resource| resource as This)
 }
 
 #[cfg(windows)]
@@ -1793,6 +1809,7 @@ impl HostTexture {
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
+            compact: false,
         }
     }
 }
@@ -1806,6 +1823,10 @@ impl Drop for HostTexture {
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
+        }
+        if self.compact {
+            COMPACT_TEXTURES[0].fetch_sub(1, Relaxed);
+            COMPACT_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
         }
     }
 }
@@ -1977,7 +1998,7 @@ impl Resource {
             },
             Backing::Address(at) => at,
             #[cfg(windows)]
-            Backing::ViewAddress(at) => at,
+            Backing::ViewAddress { at, .. } => at,
         }
     }
 }
@@ -2028,7 +2049,7 @@ fn hand_out_resource(
         if !fills(&desc) {
             let address = resource.data() as u64;
             let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-            if matches!(resource.backing, Backing::ViewAddress(_)) {
+            if matches!(resource.backing, Backing::ViewAddress { .. }) {
                 targets.entry(address).or_insert(at);
             } else {
                 targets.insert(address, at);
@@ -2257,14 +2278,13 @@ fn hand_out_address(
 }
 
 /// Textures the title placed in its own memory and views without a
-/// resource object (device 0x230, the title's streamed and
-/// interface textures), by address and description: a resource at that
-/// address, made the first time a draw reads one.
+/// resource object (device 0x230, the title's streamed and interface
+/// textures), by address, guest description and first host mip.
 /// The resource is kept for the run (views and lists name its address);
 /// its host texture is let go when nothing names it any more
 /// ([`let_go_idle`]) and made again on the next use.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
+static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14], u32), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The placed textures asked for with filler words set, as asked
@@ -2275,7 +2295,7 @@ static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>
 
 /// Placed textures asked for a second time with other filler words in
 /// their description: each was a second resource and host copy before the
-/// filler was left out of the key ([`texture_at`]).
+/// filler was left out of the key ([`placed_at`]).
 #[cfg(windows)]
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -2379,10 +2399,54 @@ pub(crate) fn placed_key(mut key: [u32; 14]) -> [u32; 14] {
     key
 }
 
-/// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
+/// Mip represented by level zero of this texture on the host.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+pub(crate) fn texture_base_mip(this: This) -> u32 {
+    match resource(this).backing {
+        Backing::ViewAddress { base_mip, .. } => base_mip,
+        _ => 0,
+    }
+}
+
+/// A 2D compressed SRV can use a smaller backing while its largest two
+/// mips are outside the view. There are at most two backing choices for
+/// the same guest allocation. Selecting one depends only on the view so
+/// descriptor creation and command preparation always agree.
+#[cfg(windows)]
+pub(crate) fn placed_sample_base(desc: &[u32; 14], view: &[u32; 16]) -> u32 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_COMPACT_MIPS").is_some_and(|v| v == "1")) {
+        compact_sample_base(desc, view)
+    } else {
+        0
+    }
+}
+
+#[cfg(windows)]
+fn compact_sample_base(desc: &[u32; 14], view: &[u32; 16]) -> u32 {
+    const BASE: u32 = 2;
+    if desc[0] == 3 // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc[5] == 0
+        && desc[4] >= 16 && desc[4].is_multiple_of(16)
+        && desc[6] >= 16 && desc[6].is_multiple_of(16)
+        && desc[7] & 0xffff == 1
+        && desc[9] == 1 && desc[10] == 0 && desc[12] == 0
+        && element(desc[8]).is_some_and(|(_, block)| block == 4)
+        && element(desc[8]) == element(view[0])
+        && view[1] == 4 // D3D12_SRV_DIMENSION_TEXTURE2D
+        && (BASE..(desc[7] >> 16)).contains(&view[4])
+        && view[6] == 0 && f32::from_bits(view[7]) == 0.0
+    {
+        BASE
+    } else {
+        0
+    }
+}
+
+/// The resource for a placed texture, preserving its original layout in
+/// title memory. `base_mip` drops the larger mips from the GPU copy only.
+#[cfg(windows)]
+pub(crate) fn placed_at(address: u64, desc: &[u32; 14], base_mip: u32) -> Option<This> {
     let raw = *desc;
     let key = placed_key(raw);
     let desc = &key;
@@ -2403,7 +2467,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
             }
         }
     }
-    if let Some(&r) = map.get(&(address, *desc)) {
+    if let Some(&r) = map.get(&(address, *desc, base_mip)) {
         return Some(r as This);
     }
     // SAFETY: 56 bytes in the description's layout.
@@ -2414,7 +2478,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut out = std::ptr::null();
     let made = hand_out_address(
         d,
-        Backing::ViewAddress(address as *mut u8),
+        Backing::ViewAddress { at: address as *mut u8, base_mip },
         std::ptr::null(),
         &RESOURCE_IIDS[0],
         &mut out,
@@ -2422,7 +2486,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
-    map.insert((address, *desc), out as usize);
+    map.insert((address, *desc, base_mip), out as usize);
     crate::texture::placed_in_host_written(address, desc);
     resource(out)
         .host
@@ -2460,7 +2524,7 @@ pub(crate) fn writable_texture_at(address: u64, words: &[u32; 14]) -> Option<Res
     if let Some(owner) = find() {
         return owner;
     }
-    let texture = texture_at(address, words)?;
+    let texture = placed_at(address, words, 0)?;
     // Another title object may have arrived while making the synthetic one.
     find().unwrap_or_else(|| Some(ResourceRef::new(texture)))
 }
@@ -2612,7 +2676,7 @@ extern "system" fn gpu_address(this: This) -> u64 {
             Backing::Placed { offset, .. } => format!("placed in a heap at {offset:#x}"),
             Backing::Address(_) => "at a title address".into(),
             #[cfg(windows)]
-            Backing::ViewAddress(_) => "a placed texture view".into(),
+            Backing::ViewAddress { .. } => "a placed texture view".into(),
         };
         ONCE[usize::from(r.desc.dimension == BUFFER)].call_once(|| {
             tracing::warn!(address = format_args!("{at:#x}"), backing, desc = ?r.desc, "a GPU address above 40 bits")
@@ -3091,6 +3155,70 @@ mod tests {
             }
         }
         for image in images { resource_release(image); }
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn compact_texture_allocates_less_and_uploads_the_guest_mip() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else { return };
+        let words = [3, 0, 0, 0, 512, 0, 512, 0x8_0001, 71, 1, 0, 0x105, 0, 0];
+        let mut view = [0; 16];
+        view[0] = 71;
+        view[1] = 4;
+        view[4] = 2;
+        view[5] = 6;
+        let base_mip = compact_sample_base(&words, &view);
+        assert_eq!(base_mip, 2);
+        view[4] = 1;
+        assert_eq!(compact_sample_base(&words, &view), 0);
+        view[4] = 2;
+        view[7] = 1.0f32.to_bits();
+        assert_eq!(compact_sample_base(&words, &view), 0);
+
+        // SAFETY: 56 bytes in the guest resource description's layout.
+        let desc = unsafe { words.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+        let texture_layout = texture_layout(&desc).unwrap();
+        let layout = &texture_layout.planes[0].layout;
+        static GUEST: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        let bytes = GUEST.get_or_init(|| {
+            let mut bytes = vec![0u8; layout.size as usize];
+            for (mip, value) in [(0u32, 0x56), (2, 0x31), (3, 0x7c)] {
+                let blocks = (512usize >> mip) / 4;
+                let pitch = blocks * 8;
+                let len = pitch * blocks;
+                layout.tile(&mut bytes, mip, 0, &vec![value; len], pitch, len).unwrap();
+            }
+            bytes
+        });
+        let address = bytes.as_ptr() as u64;
+        let full = placed_at(address, &words, 0).unwrap();
+        let compact = placed_at(address, &words, base_mip).unwrap();
+        assert_ne!(full, compact);
+        assert_eq!(placed_known(address, &words, base_mip), Some(compact));
+        let full_gpu = host_copy(full).unwrap();
+        let compact_gpu = host_copy(compact).unwrap();
+        assert!(compact_gpu.bytes < full_gpu.bytes, "{} >= {}", compact_gpu.bytes, full_gpu.bytes);
+        // SAFETY: a live GPU resource. The original guest layout stays 512x512.
+        let d = unsafe { compact_gpu.texture.GetDesc() };
+        assert_eq!((d.Width, d.Height, d.MipLevels), (128, 128, 6));
+        assert_eq!(texture_memory(compact).unwrap().1.width, 512);
+
+        let list = host.new_list().unwrap();
+        assert!(crate::texture::upload_from(&list, compact, &compact_gpu.texture, base_mip));
+        crate::list::ensure_state(&list, compact, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let (readback, footprint) =
+            crate::capture::read_back(&host.device, &list.list, &compact_gpu.texture).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy has completed, and the footprint contains BC1 blocks.
+        unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let first_block = mapped.cast::<u8>().add(footprint.Offset as usize).cast::<[u8; 8]>();
+            assert_eq!(first_block.read_unaligned(), [0x31; 8]);
+            readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+        }
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
