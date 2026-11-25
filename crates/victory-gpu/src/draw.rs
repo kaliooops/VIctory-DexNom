@@ -2262,7 +2262,7 @@ impl State {
         }
         let is_input = stage.translated().used.iter().any(|u| {
             u.root == RootType::Table
-                && u.kind == ResourceType::Srv
+                && u.kind == selector.kind
                 && u.slot == selector.table
                 && u.table_offset_dwords == selector.dword
         });
@@ -2274,10 +2274,23 @@ impl State {
         self.heap_of(handle)?;
         let view = crate::descriptor::view(handle)?;
         let placed = crate::descriptor::host::placed_texture(&view);
-        let View::Shader(resource, desc) = placed.as_ref().map_or(&view, |p| &p.view) else { return None };
-        if desc.as_ref().is_some_and(|d| crate::resource::first_mip(d) != 0) {
-            return None;
-        }
+        let resource = match (selector.kind, placed.as_ref().map_or(&view, |p| &p.view)) {
+            (ResourceType::Srv, View::Shader(resource, desc))
+                if desc.as_ref().is_none_or(|d| crate::resource::first_mip(d) == 0) => resource,
+            (ResourceType::Uav, View::Unordered(resource, _, Some(desc))) => {
+                let desc = crate::descriptor::host::uav_desc(desc);
+                if desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D {
+                    return None;
+                }
+                // SAFETY: the dimension selects the Texture2D union member.
+                let view = unsafe { desc.Anonymous.Texture2D };
+                if view.MipSlice != 0 || view.PlaneSlice != 0 {
+                    return None;
+                }
+                resource
+            }
+            _ => return None,
+        };
         crate::capture::read_input(list, frame, selector, *resource)
     }
 

@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::ResourceType;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -350,23 +351,31 @@ fn dump_after_hashes() -> &'static [String] {
 }
 
 /// `VICTORY_DUMP_INPUT=<compute hash>:s<table>+<dword offset>,...`.
-/// Capture one explicitly bound 2D SRV per named direct dispatch on listed frames.
+/// Use `s` for an SRV or `u` for a UAV. Capture a bound 2D texture before
+/// its named direct dispatch on listed frames.
 /// Use the same hash in VICTORY_DUMP_AFTER to capture outputs of that invocation.
 #[derive(Debug, PartialEq)]
 pub(crate) struct InputSelector {
     pub hash: String,
+    pub kind: ResourceType,
     pub table: u8,
     pub dword: u32,
 }
 
 fn input_selector(value: &str) -> Option<InputSelector> {
-    let (hash, binding) = value.trim().split_once(":s")?;
+    let (hash, binding) = value.trim().split_once(':')?;
+    let (kind, binding) = if let Some(binding) = binding.strip_prefix('s') {
+        (ResourceType::Srv, binding)
+    } else {
+        (ResourceType::Uav, binding.strip_prefix('u')?)
+    };
     let (table, dword) = binding.split_once('+')?;
     if hash.len() != 16 || !hash.bytes().all(|v| v.is_ascii_hexdigit()) {
         return None;
     }
     Some(InputSelector {
         hash: hash.to_ascii_lowercase(),
+        kind,
         table: table.parse().ok()?,
         dword: dword.parse().ok()?,
     })
@@ -404,7 +413,12 @@ pub(crate) fn read_input(
     if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 {
         return None;
     }
-    let (buffer, footprint) = list.read_bound_input(&host.device, &copy)?;
+    let state = if selector.kind == ResourceType::Uav {
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    } else {
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+    };
+    let (buffer, footprint) = list.read_bound_input(&host.device, &copy, state)?;
     list.keep(&buffer);
     Some(InputDump { frame, selector, resource, buffer, footprint })
 }
@@ -483,8 +497,9 @@ pub(crate) fn dump_with_input(
     let k = nth_after(&mut SEEN.lock().unwrap_or_else(|e| e.into_inner()), frame, hash);
     if let Some(i) = input {
         let f = i.footprint.Footprint;
+        let kind = if i.selector.kind == ResourceType::Uav { 'u' } else { 's' };
         let name = format!(
-            "frame-{frame}-before-{hash}-{k}-s{}+{}-{:#x}-{}x{}-f{}",
+            "frame-{frame}-before-{hash}-{k}-{kind}{}+{}-{:#x}-{}x{}-f{}",
             i.selector.table, i.selector.dword, i.resource, f.Width, f.Height, f.Format.0,
         );
         defer_texture_png(list, i.buffer, i.footprint, name);
@@ -1253,9 +1268,13 @@ mod tests {
 
     #[test]
     fn sparse_input_selector_requires_an_exact_shader_and_table_binding() {
-        let input = super::input_selector("DF11DCD012CD7382:s1+56").unwrap();
-        assert_eq!((input.hash.as_str(), input.table, input.dword), ("df11dcd012cd7382", 1, 56));
-        for bad in ["df11:s1+56", "df11dcd012cd7382:s256+56", "df11dcd012cd7382:s1-56", "wrong"] {
+        use victory_shader::ResourceType;
+
+        for (prefix, kind) in [('s', ResourceType::Srv), ('u', ResourceType::Uav)] {
+            let input = super::input_selector(&format!("DF11DCD012CD7382:{prefix}1+56")).unwrap();
+            assert_eq!((input.hash.as_str(), input.kind, input.table, input.dword), ("df11dcd012cd7382", kind, 1, 56));
+        }
+        for bad in ["df11:s1+56", "df11dcd012cd7382:s256+56", "df11dcd012cd7382:s1-56", "df11dcd012cd7382:x1+56", "wrong"] {
             assert!(super::input_selector(bad).is_none());
         }
     }

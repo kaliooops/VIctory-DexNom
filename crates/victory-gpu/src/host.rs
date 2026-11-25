@@ -5178,17 +5178,18 @@ impl HostList {
         }
     }
 
-    /// Copies a bound compute SRV, preserving the state established by the bind.
-    /// Only a texture this list has already made readable may be captured.
+    /// Copies a bound compute texture, preserving the state established by
+    /// the bind. Only a texture already in the requested state is captured.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn read_bound_input(
         &self,
         device: &ID3D12Device,
         copy: &std::sync::Arc<crate::resource::HostTexture>,
+        required: D3D12_RESOURCE_STATES,
     ) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
         let key = std::sync::Arc::as_ptr(copy) as usize;
         let state = self.states.lock().unwrap_or_else(|e| e.into_inner()).get(&key)?.1;
-        if state & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32 == 0 {
+        if state & required.0 as u32 == 0 {
             return None;
         }
         self.settle(copy, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);

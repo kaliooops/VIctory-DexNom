@@ -3999,15 +3999,17 @@ float4 lit() : SV_Target { return 1.0; }
         };
         let null = std::ptr::null();
         let mut title = null;
-        let desc = texture(2, 2, 28, 1);
+        let desc = ResourceDesc { flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32, ..texture(2, 2, 28, 1) };
         assert_eq!(create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut title), S_OK);
         let texture = host_copy(title).unwrap();
         let list = host.new_list().unwrap();
+        let srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         // An unbound texture has no known state in this list; leave it alone.
-        assert!(list.read_bound_input(&host.device, &texture).is_none());
-        let read_state = (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE).0 as u32;
+        assert!(list.read_bound_input(&host.device, &texture, srv).is_none());
+        let reader = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | srv;
         let mut reads = Vec::new();
-        for rgba in [0x12345678_u32, 0xdeadbeef] {
+        for (rgba, bound, required, other) in [(0x12345678_u32, reader, srv, uav), (0xdeadbeef, uav, uav, srv)] {
             let (upload, data) = host.upload_buffer(512).unwrap();
             let dst = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: unsafe { std::mem::transmute_copy(&texture.texture) },
@@ -4026,16 +4028,17 @@ float4 lit() : SV_Target { return 1.0; }
                 },
             };
             crate::list::ensure_state(&list, title, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
-            assert!(list.read_bound_input(&host.device, &texture).is_none());
+            assert!(list.read_bound_input(&host.device, &texture, required).is_none());
             // SAFETY: two rows of two RGBA texels, each row 256 bytes apart.
             unsafe {
                 for offset in [0, 4, 256, 260] { data.add(offset).cast::<u32>().write(rgba); }
                 list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
             }
             list.keep(&upload);
-            crate::list::ensure_state(&list, title, read_state);
-            let (buffer, footprint) = list.read_bound_input(&host.device, &texture).unwrap();
-            assert!(list.transition(title, read_state).is_none(), "restore both reader bits");
+            crate::list::ensure_state(&list, title, bound.0 as u32);
+            assert!(list.read_bound_input(&host.device, &texture, other).is_none());
+            let (buffer, footprint) = list.read_bound_input(&host.device, &texture, required).unwrap();
+            assert!(list.transition(title, bound.0 as u32).is_none(), "restore the bound state");
             reads.push((buffer, footprint.Footprint.RowPitch as usize, rgba));
         }
         resource_release(title);
