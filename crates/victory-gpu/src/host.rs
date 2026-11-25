@@ -6881,12 +6881,16 @@ impl Meter {
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
-            let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if through + left > 0.0 {
+            let left = crate::texture::REMAP_DEFERRED.swap(0, Ordering::Relaxed) as f64 / frames;
+            if left > 0.0 {
                 tracing::info!(
-                    "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
-                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
+                    "{left:.1} texture refreshes per frame deferred while title memory was being remapped (VICTORY_TEXTURE_NO_WAIT=1)"
                 );
+            }
+            let [batches, extents] = crate::watch::REMAP_BATCHES.each_ref()
+                .map(|counter| counter.swap(0, Ordering::Relaxed));
+            if batches != 0 {
+                tracing::info!(batches, extents, "page mapping batch requests");
             }
         }
         {

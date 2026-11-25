@@ -407,29 +407,23 @@ pub(crate) struct PhysicalSpan {
     offset: u64,
 }
 
-pub(crate) fn physical_spans(range: &std::ops::Range<usize>) -> Vec<PhysicalSpan> {
-    if range.is_empty() {
-        return Vec::new();
-    }
+pub(crate) fn physical_spans(ranges: &[std::ops::Range<usize>]) -> Vec<PhysicalSpan> {
     let v = views();
-    let search = v
-        .views
-        .range(..=range.start)
-        .next_back()
-        .map_or(range.start, |(&at, _)| at);
-    v.views
-        .range(search..range.end)
-        .filter_map(|(&base, &(size, section, offset))| {
+    let mut spans = Vec::new();
+    for range in ranges.iter().filter(|range| !range.is_empty()) {
+        let search = v.views.range(..=range.start).next_back().map_or(range.start, |(&at, _)| at);
+        spans.extend(v.views.range(search..range.end).filter_map(|(&base, &(size, section, offset))| {
             let start = range.start.max(base);
             let end = range.end.min(base.saturating_add(size));
-            (start < end).then_some(PhysicalSpan {
+            (start < end).then(|| PhysicalSpan {
                 start,
                 end,
                 section,
                 offset: offset + (start - base) as u64,
             })
-        })
-        .collect()
+        }));
+    }
+    spans
 }
 
 /// Walk the union of the old and new view boundaries without enumerating

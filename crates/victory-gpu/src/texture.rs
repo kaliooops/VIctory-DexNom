@@ -302,23 +302,16 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// of it (1,345 of 1,381 ms; 3,630 of 3,708; the write-watch askings 3-12
 /// ms, the texture's own lock 0).
 ///
-/// With the switch the refresh asks for the lock without waiting. If the
-/// runtime has it, the texture is read through the kernel instead, which
-/// needs no lock: it fails if a page is not there, and then the texture is
-/// left as it is and read at its next refresh, a frame later. A read
-/// through the kernel costs about 0.6 ms a megabyte against 0.3 in place.
-///
-/// What changes for the picture: a texture that arrives while the runtime
-/// is remapping may show a frame later. It never shows partly read.
+/// With the switch the refresh tries to pin its range and retries later
+/// when a remap overlaps. A kernel copy can succeed on a mixture of old
+/// and new pages during a scatter remap, so it also needs a stable range.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
 }
 
-/// Since the last frame-rate line, with [`no_wait`]: refreshes that read
-/// through the kernel because title memory was being remapped, and those
-/// left for the next refresh because a page was not there.
-pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Refreshes deferred since the last frame-rate line with [`no_wait`].
+pub(crate) static REMAP_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
@@ -720,6 +713,18 @@ impl Staging {
         let Some(end) = start.checked_add(size) else { return 0 };
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
+        // Keep the write-watch query and both copy paths within the same
+        // mapping snapshot, including temporarily removed Windows views.
+        let _mapped = if no_wait() {
+            let Some(mapped) = crate::watch::title_memory_reading_now(start..end) else {
+                REMAP_DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                last.asked = 0;
+                return 0;
+            };
+            mapped
+        } else {
+            waited(2, || crate::watch::title_memory_reading_range(start..end))
+        };
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, end, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
@@ -768,20 +773,6 @@ impl Staging {
             }
             unseen = unwritten;
         }
-        // Pin the exact span through the committed check, hash and detile.
-        // Windows temporarily removes whole physical views on a partial
-        // remap; xmem includes those old extents in its writer range.
-        let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now(start..end) else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
-        } else {
-            waited(2, || crate::watch::title_memory_reading_range(start..end))
-        };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -883,35 +874,6 @@ impl Staging {
             }
         }
         last.unguarded = frame + more;
-    }
-
-    /// A refresh while the runtime is remapping title memory ([`no_wait`]):
-    /// the texture is read through the kernel, which fails if a page of it
-    /// is not there at this moment. Then nothing is taken and the texture
-    /// is looked at again at its next refresh (what was learnt about writes
-    /// to it is forgotten, so that it is not passed over as unwritten).
-    /// Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
-        let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
-                return false;
-            }
-            let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
-                self.detile(read);
-            }
-            true
-        });
-        if read {
-            UNLOCKED[0].fetch_add(1, Relaxed);
-            size
-        } else {
-            UNLOCKED[1].fetch_add(1, Relaxed);
-            last.asked = 0;
-            0
-        }
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.

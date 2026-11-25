@@ -788,7 +788,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
 struct Mapping {
-    changing: Option<Range<usize>>,
+    changing: Option<MappingRanges>,
     readers: Vec<Range<usize>>,
 }
 
@@ -800,13 +800,33 @@ static WRITER: Mutex<()> = Mutex::new(());
 static MAPPING_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
 const ALL_MEMORY: Range<usize> = 0..usize::MAX;
 
-fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
-    a.start.max(b.start) < a.end.min(b.end)
+pub(crate) static REMAP_BATCHES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[derive(Clone)]
+enum MappingRanges {
+    One(Range<usize>),
+    Batch(std::sync::Arc<[Range<usize>]>),
+}
+
+impl MappingRanges {
+    fn as_slice(&self) -> &[Range<usize>] {
+        match self {
+            Self::One(range) => std::slice::from_ref(range),
+            Self::Batch(ranges) => ranges,
+        }
+    }
+
+    fn intersects(&self, range: &Range<usize>) -> bool {
+        let ranges = self.as_slice();
+        let first = ranges.partition_point(|r| r.end <= range.start);
+        !range.is_empty() && ranges.get(first).is_some_and(|r| !r.is_empty() && r.start < range.end)
+    }
 }
 
 impl Mapping {
     fn changing(&self, range: &Range<usize>) -> bool {
-        self.changing.as_ref().is_some_and(|w| overlaps(w, range))
+        self.changing.as_ref().is_some_and(|w| w.intersects(range))
     }
 
     fn pin(&mut self, range: Range<usize>) -> Reading {
@@ -818,7 +838,7 @@ impl Mapping {
 /// The only active change of physical mappings.
 pub struct Remapping {
     _writer: std::sync::MutexGuard<'static, ()>,
-    range: Range<usize>,
+    ranges: MappingRanges,
     previous: Vec<crate::inplace::PhysicalSpan>,
 }
 
@@ -830,25 +850,57 @@ pub fn title_memory_remapping() -> Remapping {
 /// Protects every address that can be unmapped during the operation,
 /// including whole old views that Windows temporarily removes.
 pub fn title_memory_remapping_range(range: Range<usize>) -> Remapping {
+    remapping(MappingRanges::One(range))
+}
+
+/// Publishes one mapping transaction across disjoint addresses. Each
+/// interval includes any old Windows view temporarily removed by the caller.
+pub fn title_memory_remapping_ranges(mut ranges: Vec<Range<usize>>) -> Remapping {
+    ranges.retain(|range| !range.is_empty());
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut count = 0;
+    for index in 0..ranges.len() {
+        let range = ranges[index].clone();
+        if count != 0 && range.start <= ranges[count - 1].end {
+            let previous = &mut ranges[count - 1];
+            previous.end = previous.end.max(range.end);
+        } else {
+            ranges[count] = range;
+            count += 1;
+        }
+    }
+    ranges.truncate(count);
+    if count != 0 {
+        use std::sync::atomic::Ordering::Relaxed;
+        REMAP_BATCHES[0].fetch_add(1, Relaxed);
+        REMAP_BATCHES[1].fetch_add(count as u64, Relaxed);
+    }
+    match ranges.as_slice() {
+        [range] => remapping(MappingRanges::One(range.clone())),
+        _ => remapping(MappingRanges::Batch(ranges.into())),
+    }
+}
+
+fn remapping(ranges: MappingRanges) -> Remapping {
     let writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
-    state.changing = Some(range.clone());
+    state.changing = Some(ranges.clone());
     drop(
         MAPPING_CHANGED
-            .wait_while(state, |s| s.readers.iter().any(|r| overlaps(r, &range)))
+            .wait_while(state, |s| s.readers.iter().any(|r| ranges.intersects(r)))
             .unwrap_or_else(|e| e.into_inner()),
     );
-    let previous = crate::inplace::physical_spans(&range);
+    let previous = crate::inplace::physical_spans(ranges.as_slice());
     Remapping {
         _writer: writer,
-        range,
+        ranges,
         previous,
     }
 }
 
 impl Drop for Remapping {
     fn drop(&mut self) {
-        let current = crate::inplace::physical_spans(&self.range);
+        let current = crate::inplace::physical_spans(self.ranges.as_slice());
         crate::inplace::physical_changes(&self.previous, &current, crate::writeback::remapped);
         MAPPING.lock().unwrap_or_else(|e| e.into_inner()).changing = None;
         MAPPING_CHANGED.notify_all();
@@ -1544,12 +1596,22 @@ mod tests {
 #[cfg(test)]
 mod mapping_tests {
     use super::{
-        title_memory_reading, title_memory_reading_range, title_memory_remapping,
-        title_memory_remapping_range,
+        title_memory_reading, title_memory_reading_now, title_memory_reading_range,
+        title_memory_remapping, title_memory_remapping_range, title_memory_remapping_ranges,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
+
+    #[test]
+    fn a_mapping_batch_leaves_the_gap_between_destinations_readable() {
+        let changing = title_memory_remapping_ranges(vec![0x40000..0x50000, 0x10000..0x20000]);
+        assert!(title_memory_reading_now(0x10000..0x10001).is_none());
+        assert!(title_memory_reading_now(0x40000..0x40001).is_none());
+        assert!(title_memory_reading_now(0x20000..0x40000).is_some());
+        drop(changing);
+        assert!(title_memory_reading_now(0x10000..0x50000).is_some());
+    }
 
     /// A change of mapping waits for a read in place that is under way, and
     /// a read in place waits for a change of mapping.

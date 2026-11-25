@@ -919,6 +919,7 @@ extern "system" fn copy_page_mappings(
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
     let mut ok = true;
+    let mut mappings = Vec::new();
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
@@ -928,17 +929,36 @@ extern "system" fn copy_page_mappings(
         let mut at = b.destination;
         for r in ranges {
             let len = u64::from(r.count) * PAGE;
-            let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
-            let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
+            let Some(end) = at.checked_add(len) else {
+                ok = false;
+                break;
             };
-            at += len;
+            let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
+            let source = match r.kind {
+                0 if inside(r.count) => pool.checked_add(u64::from(r.start) * PAGE),
+                1 if inside(1) => pool.checked_add(u64::from(r.start) * PAGE),
+                2 => Some(0),
+                3 => {
+                    at = end;
+                    continue;
+                }
+                _ => None,
+            };
+            if let Some(source) = source {
+                mappings.push(crate::resource::PageMapping {
+                    destination: at,
+                    source,
+                    bytes: len,
+                    repeat: r.kind == 1,
+                });
+            } else {
+                ok = false;
+            }
+            at = end;
         }
+    }
+    if !mappings.is_empty() {
+        ok &= map(&mappings);
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();

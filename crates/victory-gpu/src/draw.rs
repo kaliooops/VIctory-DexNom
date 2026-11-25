@@ -1912,6 +1912,8 @@ impl State {
                 // Of the mips the view shows: what lies behind them is
                 // another texture's.
                 let len = crate::resource::placed_bytes_from(&resource, crate::resource::first_mip(&desc)).unwrap_or(1);
+                let start = address as usize;
+                let _mapping = crate::watch::title_memory_reading_range(start..start.saturating_add(len as usize));
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
