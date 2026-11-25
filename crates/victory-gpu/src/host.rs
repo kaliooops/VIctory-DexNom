@@ -1822,6 +1822,8 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Indexed texture slots to acknowledge after this list is sent.
+    texture_uploads: Vec<crate::descriptor::host::TextureUpload>,
     /// Numbered guest memory copies already prepared by this list.
     raw_copies: RawCopyCoverage,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -4669,6 +4671,10 @@ impl Host {
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
+            } else {
+                for list in runs {
+                    list.texture_uploads_sent(frame);
+                }
             }
             let back = declared_writes(runs);
             let mut texture_writes = Vec::new();
@@ -4783,6 +4789,10 @@ impl Host {
                 self.removal_data(runs),
                 last_notes(runs)
             ));
+        } else {
+            for list in runs {
+                list.texture_uploads_sent(frame);
+            }
         }
         submitting(3, runs.len());
         // What shaders wrote goes back before the bottom-of-pipe writes,
@@ -5826,6 +5836,11 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// The first attempt did not prepare the resource. Let this list retry.
+    pub(crate) fn cancel_first_use(&self, key: usize) {
+        self.deferred().textures.remove(&key);
+    }
+
     /// Independent lists can discover new guest memory copies in any order.
     pub(crate) fn raw_memory_ranges(
         &self,
@@ -5862,6 +5877,17 @@ impl HostList {
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
+    }
+
+    pub(crate) fn note_texture_upload(&self, upload: crate::descriptor::host::TextureUpload) {
+        self.deferred().texture_uploads.push(upload);
+    }
+
+    fn texture_uploads_sent(&self, frame: u64) {
+        let uploads = std::mem::take(&mut self.deferred().texture_uploads);
+        for upload in uploads {
+            upload.submitted(frame);
+        }
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`

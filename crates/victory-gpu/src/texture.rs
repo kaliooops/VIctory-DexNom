@@ -574,8 +574,8 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 
 /// [`upload`] of the mips from `first` on, the ones a view shows: of a
 /// placed texture the title may have no memory for the larger ones, and
-/// what lies there is another texture's.
-pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resource, first: u32) {
+/// what lies there is another texture's. False if staging could not be made.
+pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resource, first: u32) -> bool {
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -583,11 +583,18 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) && staged_from(resource) <= first {
-        return;
+    if host_written {
+        return true;
+    }
+    let first_use = list.first_use(resource as usize);
+    if !first_use && staged_from(resource) <= first {
+        return true;
     }
     let Some(staging) = staging(resource, texture, first) else {
-        return;
+        if first_use {
+            list.cancel_first_use(resource as usize);
+        }
+        return false;
     };
     use std::sync::atomic::Ordering::Relaxed;
     staging.used.store(crate::host::moment(), Relaxed);
@@ -599,7 +606,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
-        return;
+        return true;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
@@ -666,6 +673,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     }
     // Once per submission however many of its lists sample the texture.
     list.defer_texture(staging);
+    true
 }
 
 impl Staging {

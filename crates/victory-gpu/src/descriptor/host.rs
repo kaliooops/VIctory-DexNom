@@ -5,7 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -83,7 +83,7 @@ pub(crate) struct HostHeap {
     /// are due: such a texture is uploaded when a draw reads it through a
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
-    textures: Mutex<TextureQueue>,
+    textures: Arc<Mutex<TextureQueue>>,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
     /// read it through a table, or made a table it lies in (with
     /// [`TABLED_READ`] set if the draw read it). The draw that
@@ -383,7 +383,6 @@ fn tabled_out() -> bool {
 }
 
 /// What the queue of textures picked by index knows of a title slot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
     /// The frame from which the slot is due.
     due: u64,
@@ -398,6 +397,57 @@ struct Waiting {
     /// Bytes of its memory that were mapped when it was last uploaded
     /// without all of it there; 0: not uploaded yet.
     mapped: u64,
+    /// A recorded list owns this attempt until it is sent or discarded.
+    recording: Option<(Weak<()>, u64)>,
+}
+
+impl Waiting {
+    fn ready(&self, frame: u64, now: u64) -> bool {
+        self.due <= frame && self.recording.as_ref().is_none_or(|(list, retry_at)| {
+            list.strong_count() == 0 || now >= *retry_at
+        })
+    }
+}
+
+/// One indexed upload recorded into a list. Its queue entry is acknowledged
+/// only once the host queue accepts that list.
+pub(crate) struct TextureUpload {
+    queue: Arc<Mutex<TextureQueue>>,
+    index: u32,
+    write: u64,
+    attempt: Arc<()>,
+    partial: Option<(u64, u64)>,
+    recheck: Option<((u64, u64), u64)>,
+}
+
+impl TextureUpload {
+    pub(crate) fn record(
+        mut self,
+        list: &crate::host::HostList,
+        partial: Option<(u64, u64)>,
+        recheck: Option<((u64, u64), u64)>,
+    ) {
+        self.partial = partial;
+        self.recheck = recheck;
+        list.note_texture_upload(self);
+    }
+
+    pub(crate) fn submitted(self, frame: u64) {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(waiting) = queue.same(self.index, self.write) else { return };
+        if waiting.recording.as_ref().is_none_or(|(attempt, _)| attempt.as_ptr() != Arc::as_ptr(&self.attempt)) {
+            return;
+        }
+        waiting.recording = None;
+        if let Some((due, mapped)) = self.partial {
+            queue.partly(self.index, self.write, due.max(frame.saturating_add(1)), mapped);
+        } else {
+            queue.done(self.index, self.write);
+            if let Some((address, fingerprint)) = self.recheck {
+                queue.recheck(self.index, frame, address, fingerprint);
+            }
+        }
+    }
 }
 
 /// A title slot whose texture was uploaded whole, and is looked at again:
@@ -445,7 +495,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         self.rechecks.remove(&index);
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, recording: None });
     }
 
     fn remove(&mut self, index: u32) {
@@ -507,7 +557,8 @@ impl TextureQueue {
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         let mut again = Vec::new();
         let mut fresh = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
+        let now = crate::host::now_ms();
+        for (&index, w) in self.slots.iter().filter(|(_, w)| w.ready(frame, now)) {
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
             class.push((index, w.write));
         }
@@ -536,6 +587,18 @@ impl TextureQueue {
     /// The entry of `index` if it is still the write the pass was handed.
     fn same(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
         self.slots.get_mut(&index).filter(|w| w.write == write)
+    }
+
+    fn claim_upload(&mut self, index: u32, write: u64, frame: u64, now: u64) -> Option<Arc<()>> {
+        const RETRY_MS: u64 = 4_000;
+        let slot = self.same(index, write)?;
+        if !slot.ready(frame, now) {
+            return None;
+        }
+        let attempt = Arc::new(());
+        // A list that is kept closed indefinitely cannot reserve the slot indefinitely.
+        slot.recording = Some((Arc::downgrade(&attempt), now.saturating_add(RETRY_MS)));
+        Some(attempt)
     }
 
     /// Slot `index` is up to date: out of the queue until written again.
@@ -571,7 +634,7 @@ impl TextureQueue {
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
         self.rechecks.remove(&index);
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, recording: None });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -585,13 +648,14 @@ impl TextureQueue {
     /// part; and the frames the oldest due one has waited since its write.
     fn census(&self, frame: u64) -> [u64; 5] {
         let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
+        let now = crate::host::now_ms();
         for w in self.slots.values() {
             if w.mapped > 0 {
                 c[3] += 1;
             } else if w.looks > 0 {
                 c[2] += 1;
             }
-            if w.due <= frame {
+            if w.ready(frame, now) {
                 c[1] += 1;
                 c[4] = c[4].max(frame.saturating_sub(w.written));
             }
@@ -864,7 +928,7 @@ impl HostHeap {
             buffers: Mutex::default(),
             changed: Mutex::default(),
             buffer_pass: Mutex::default(),
-            textures: Mutex::default(),
+            textures: Arc::default(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
@@ -1129,10 +1193,11 @@ impl HostHeap {
     /// (`crate::resource::card_accounting`).
     pub(crate) fn texture_slots_all_due(&self, frame: u64) -> Vec<(u32, bool)> {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let now = crate::host::now_ms();
         textures
             .slots
             .iter()
-            .filter(|(_, w)| w.due <= frame)
+            .filter(|(_, w)| w.ready(frame, now))
             .map(|(&index, w)| (index, w.mapped > 0 || textures.rechecks.contains_key(&index)))
             .collect()
     }
@@ -1149,10 +1214,11 @@ impl HostHeap {
         }
     }
 
-    /// Title slot `index` was uploaded whole: see [`TextureQueue::recheck`].
-    pub(crate) fn texture_slot_recheck(&self, index: u32, frame: u64, at: (u64, u64), print: u64) {
+    /// Keep a slot pending while the list with its upload is only recorded.
+    pub(crate) fn texture_slot_begin(&self, index: u32, write: u64, frame: u64) -> Option<TextureUpload> {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, frame, at, print);
+        let attempt = textures.claim_upload(index, write, frame, crate::host::now_ms())?;
+        Some(TextureUpload { queue: self.textures.clone(), index, write, attempt, partial: None, recheck: None })
     }
 
     /// Looks again at slots uploaded whole: the title writes a texture's
@@ -3532,6 +3598,66 @@ mod tests {
         assert_eq!(slots(4, 1), [9]);
         assert_eq!(slots(5, 1), [19]);
         assert!(slots(5, 0).is_empty());
+    }
+
+    #[test]
+    fn indexed_texture_uploads_wait_for_submission_and_retry_discarded_lists() {
+        let (Some(gpu), Some(heap)) = (host(), HostHeap::new(false, 8)) else {
+            assert!(!crate::host::on_warp(), "requested WARP device unavailable");
+            return;
+        };
+        let frame = 10;
+        heap.queue_texture(2, true, false, frame);
+        let due = || heap.texture_slots_due(frame, 8).0;
+        let (index, write) = due()[0];
+        let discarded = gpu.new_list().unwrap();
+        heap.texture_slot_begin(index, write, frame).unwrap().record(&discarded, None, None);
+        assert!(due().is_empty(), "avoid staging another upload while the list may still run");
+        assert_eq!(heap.texture_slots_due(frame, 0).1[0], 1, "recording is not submission");
+        drop(discarded);
+        assert_eq!(due(), [(index, write)]);
+
+        let sent = gpu.new_list().unwrap();
+        heap.texture_slot_begin(index, write, frame).unwrap().record(&sent, None, Some(((0x1000, 64), 7)));
+        sent.close();
+        gpu.execute(&[&sent]);
+        assert_eq!(heap.texture_slots_due(frame, 0).1[0], 0);
+        assert_eq!(heap.textures.lock().unwrap().rechecks[&index].print, 7);
+
+        // Replaying a submitted list cannot remove a subsequent slot write.
+        heap.queue_texture(index, true, false, frame + 1);
+        gpu.execute(&[&sent]);
+        let newer = heap.texture_slots_due(frame + 1, 8).0;
+        assert_eq!(newer.len(), 1);
+        assert_ne!(newer[0].1, write);
+    }
+
+    #[test]
+    fn indexed_texture_uploads_retry_held_lists_and_ignore_stale_submissions() {
+        let queue = Arc::new(Mutex::new(TextureQueue::default()));
+        let make_upload = |write, now| {
+            let attempt = queue.lock().unwrap().claim_upload(1, write, 10, now)?;
+            Some(TextureUpload { queue: queue.clone(), index: 1, write, attempt, partial: None, recheck: None })
+        };
+        queue.lock().unwrap().written(1, 10, 10, false);
+        let write = queue.lock().unwrap().slots[&1].write;
+        let old = make_upload(write, 0).unwrap();
+        let retry_at = queue.lock().unwrap().slots[&1].recording.as_ref().unwrap().1;
+        assert!(make_upload(write, retry_at - 1).is_none());
+        let mut retry = make_upload(write, retry_at).unwrap();
+        old.submitted(11);
+        assert_eq!(queue.lock().unwrap().slots[&1].write, write);
+        retry.partial = Some((11, 512));
+        retry.submitted(15);
+        {
+            let q = queue.lock().unwrap();
+            assert_eq!(q.mapped(1), 512);
+            assert!(q.due(15, 8).is_empty());
+        }
+        let old = queue.lock().unwrap().claim_upload(1, write, 16, retry_at).unwrap();
+        queue.lock().unwrap().changed(1, 16, 16);
+        TextureUpload { queue: queue.clone(), index: 1, write, attempt: old, partial: None, recheck: None }.submitted(16);
+        assert_ne!(queue.lock().unwrap().due(16, 8)[0].1, write);
     }
 
     #[test]

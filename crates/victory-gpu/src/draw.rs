@@ -2001,6 +2001,7 @@ impl State {
                 host.texture_slot_done(index, write, None);
                 continue;
             }
+            let Some(upload) = host.texture_slot_begin(index, write, frame) else { continue };
             // A texture that has a staging buffer now is one draws read
             // through a table: they upload it, and check it at every
             // submission that samples it.
@@ -2008,8 +2009,11 @@ impl State {
             if tabled {
                 crate::texture::upload_again(resource);
             }
-            if let Some(view) = &view {
-                readable(list, sampled.kind, view);
+            if let Some(view) = &view
+                && !readable(list, sampled.kind, view)
+            {
+                host.texture_slot_later(index, write, frame, most);
+                continue;
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2040,10 +2044,10 @@ impl State {
                 // next draw that reads the texture through a table stage,
                 // detile and upload all of it once more.
                 HEAP_TEXTURES_TABLED.fetch_add(1, Ordering::Relaxed);
-                host.texture_slot_done(index, write, again);
+                upload.record(list, again, None);
                 continue;
             }
-            // Uploaded: the list holds the staging buffer until it has run;
+            // Recorded: the list holds the staging buffer until it has run;
             // a table read, or the next look at a texture not all mapped
             // yet, makes it anew. (Kept for those until now: every partly
             // streamed texture of the heap held a staging buffer of its full
@@ -2057,11 +2061,8 @@ impl State {
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
-            host.texture_slot_done(index, write, again);
-            // Whole and uploaded: looked at again (`texture_slots_rechecked`).
-            if let Some((at, len)) = memory {
-                host.texture_slot_recheck(index, frame, (at, len), crate::texture::fingerprint(at, len));
-            }
+            let recheck = memory.map(|(at, len)| ((at, len), crate::texture::fingerprint(at, len)));
+            upload.record(list, again, recheck);
         }
         catching_up(began.elapsed().saturating_sub(plain));
     }
@@ -3509,7 +3510,7 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+fn readable(list: &HostList, kind: ResourceType, view: &View) -> bool {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().map_or(view, |p| &p.view);
@@ -3531,6 +3532,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             }
         }
     }
+    let mut prepared = true;
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
             // A view the title placed, in another format, in the memory of
@@ -3547,7 +3549,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                     (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
                     _ => 0,
                 };
-                crate::texture::upload_from(list, *resource as This, t, first);
+                prepared = crate::texture::upload_from(list, *resource as This, t, first);
             }
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(*resource as This, false, false);
@@ -3588,6 +3590,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         }
         _ => {}
     }
+    prepared
 }
 
 /// The pixel shaders whose draws get their slots listed
