@@ -1514,17 +1514,21 @@ impl HostHeap {
         }
     }
 
-    /// The memory of the texture title slot `index` views is not mapped
-    /// (any more): a host slot made from it becomes null again, so that
-    /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
-    /// keeps what it views). True if the slot was made.
-    pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
+    /// An unmapped texture releases its host descriptor only while the
+    /// checked write still owns the queue entry. A replacement may have
+    /// been installed while the pass was looking at the old texture.
+    pub(crate) fn texture_slot_gone(&self, index: u32, write: u64) -> bool {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         if made.get(index as usize).is_none_or(|&key| key == 0) {
             return false;
         }
+        // Mirror publishes the queue entry and host descriptor in this same lock order.
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        if textures.same(index, write).is_none() {
+            return false;
+        }
         self.unmake(&mut made, index);
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).rechecks.remove(&index);
+        textures.rechecks.remove(&index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
     }
@@ -3759,6 +3763,35 @@ mod tests {
         queue.lock().unwrap().changed(1, 16, 16);
         TextureUpload { queue: queue.clone(), index: 1, write, attempt: old, partial: None, recheck: None }.submitted(16);
         assert_ne!(queue.lock().unwrap().due(16, 8)[0].1, write);
+    }
+
+    #[test]
+    fn an_unmapped_texture_check_cannot_clear_a_newer_descriptor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let index = 1;
+        let record = |address| {
+            let [id, generation] = super::super::words_for(View::Constant(address, 256));
+            u64::from(generation) << 32 | u64::from(id)
+        };
+        let queue_write = || {
+            let mut queue = heap.textures.lock().unwrap();
+            queue.written(index, 1, 1, false);
+            queue.slots[&index].write
+        };
+        let old = queue_write();
+        heap.made.lock().unwrap()[index as usize] = record(0x10000);
+
+        // The old look found no mapped pages. A replacement was installed before it cleared the slot.
+        let new = queue_write();
+        let current = record(0x20000);
+        heap.made.lock().unwrap()[index as usize] = current;
+        assert!(!heap.texture_slot_gone(index, old));
+        assert_eq!(heap.made.lock().unwrap()[index as usize], current);
+
+        assert!(heap.texture_slot_gone(index, new));
+        assert_eq!(heap.made.lock().unwrap()[index as usize], 0);
     }
 
     #[test]
