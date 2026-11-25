@@ -2362,8 +2362,9 @@ pub(crate) fn first_mip(view: &[u32]) -> u32 {
     }
 }
 
+/// Canonical description used to identify an address-backed texture.
 #[cfg(windows)]
-fn placed_key(mut key: [u32; 14]) -> [u32; 14] {
+pub(crate) fn placed_key(mut key: [u32; 14]) -> [u32; 14] {
     // Words 1 and 13 of the description are the filler of its layout
     // (after the dimension, and at the end): the title leaves there what
     // its stack held, and two views of one texture that differed only in

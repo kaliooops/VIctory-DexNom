@@ -146,10 +146,11 @@ impl Spans {
     /// The bytes of title memory the mips from `first` on of a placed
     /// texture with the resource description `desc` take.
     fn bytes(&mut self, desc: &[u32; 14], first: u32) -> Option<u64> {
+        let key = crate::resource::placed_key(*desc);
         *self
             .sizes
-            .entry((*desc, first))
-            .or_insert_with(|| crate::resource::placed_bytes_from(desc, first))
+            .entry((key, first))
+            .or_insert_with(|| crate::resource::placed_bytes_from(&key, first))
     }
 
     /// The spans that overlap `[start, end)`.
@@ -166,11 +167,11 @@ impl Spans {
     }
 
     /// The spans that say otherwise than that a texture with the resource
-    /// description `desc` lies in `[start, end)`.
-    fn against(&self, start: u64, end: u64, desc: &[u32; 14]) -> Vec<(u64, u64)> {
+    /// description key lies in `[start, end)`.
+    fn against(&self, start: u64, end: u64, key: &[u32; 14]) -> Vec<(u64, u64)> {
         let mut spans = self.overlapping(start, end);
         spans.retain(|span| {
-            let same = span.0 == start && (span.1 == end || self.spans.get(span).is_some_and(|s| s.0 == *desc));
+            let same = span.0 == start && (span.1 == end || self.spans.get(span).is_some_and(|s| s.0 == *key));
             !same
         });
         spans
@@ -189,8 +190,9 @@ impl Spans {
         if end <= start {
             return Vec::new();
         }
+        let key = crate::resource::placed_key(*desc);
         let mut stale = Vec::new();
-        for span in self.against(start, end, desc) {
+        for span in self.against(start, end, &key) {
             if !newer {
                 return stale;
             }
@@ -201,7 +203,7 @@ impl Spans {
                 }
             }
         }
-        self.spans.entry((start, end)).or_insert_with(|| (*desc, Default::default())).1.insert(index);
+        self.spans.entry((start, end)).or_insert_with(|| (key, Default::default())).1.insert(index);
         self.by_slot.insert(index, (start, end));
         stale
     }
@@ -226,7 +228,7 @@ impl Spans {
         if self.by_slot.get(&index) == Some(&(start, end)) {
             return (Claim::Own, None);
         }
-        let spans = self.against(start, end, desc);
+        let spans = self.against(start, end, &crate::resource::placed_key(*desc));
         match spans.first() {
             None => (Claim::Free, None),
             Some(&span) if spans.iter().all(|s| s.0 == start) => (Claim::SameStart, Some(span)),
@@ -3030,7 +3032,12 @@ fn keep_views() -> bool {
 fn same_placed_texture(a: &View, b: &View) -> bool {
     match (a, b) {
         (View::Placed(false, resource, desc), View::Placed(false, other, other_desc)) => {
-            resource[0] != 1 && resource == other && desc[10..12] == other_desc[10..12]
+            resource[0] != 1
+                && desc[10..12] == other_desc[10..12]
+                && (resource == other
+                    || (resource[12] & 7 == 0
+                        && crate::resource::placed_key(*resource)
+                            == crate::resource::placed_key(*other)))
         }
         _ => false,
     }
@@ -3884,11 +3891,15 @@ mod tests {
         assert!(small < a);
         assert!(spans.note(3, at, small, &texture, true).is_empty());
         assert_eq!(spans.slots_in(at, at + 1), [3, 1]);
-        // More of it streamed in, over the next texture: that one is stale.
-        let more = end(&mut spans, &texture, at, 1);
+        // More of it streamed in with different padding, over the next texture.
+        let mut updated = texture;
+        updated[1] = 0xabcd;
+        updated[13] = 0x1234;
+        let more = end(&mut spans, &updated, at, 1);
         assert!(more > b);
-        assert_eq!(spans.note(1, at, more, &texture, true), [2]);
+        assert_eq!(spans.note(1, at, more, &updated, true), [2]);
         assert_eq!(spans.claim(3, at, small, &texture), (Claim::Own, None));
+        assert_eq!(spans.claim(4, at, small, &texture), (Claim::Free, None));
         assert_eq!(spans.claim(2, a, b, &next), (Claim::Other, Some((at, more))));
     }
 
@@ -4115,6 +4126,51 @@ mod tests {
         );
         assert!(crate::resource::placed_known(address, &other).is_none());
         assert!(device_removed().is_none());
+    }
+
+    #[test]
+    fn pending_mip_view_keeps_resident_texture_with_different_padding() {
+        if host().is_none() {
+            return;
+        }
+        static GUEST_BYTES: [u8; 65536] = [0; 65536];
+        let address = GUEST_BYTES.as_ptr() as u64;
+        let resource = [3, 0, 0, 0, 32, 0, 32, 0x3_0001, 28, 1, 0, 0x105, 0, 0];
+        let mut desc = [0; 16];
+        desc[0] = 28;
+        desc[1] = 4;
+        desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc[4] = 1;
+        desc[5] = 1;
+        desc[10] = address as u32;
+        desc[11] = (address >> 32) as u32;
+        let original = View::Placed(false, resource, desc);
+        let heap = HostHeap::new(false, 4).unwrap();
+        let mirror = |view: &View, for_draw| {
+            let [index, generation] = super::super::words_for(view.clone());
+            let words = [VIEW_TAG, index, generation, 0];
+            assert_eq!(
+                heap.mirror(2, words.as_ptr() as u64, for_draw).as_ref(),
+                Some(view)
+            );
+        };
+        mirror(&original, true);
+        let texture = crate::resource::placed_known(address, &resource).unwrap();
+        let backing = crate::resource::host_resource(texture).unwrap().clone();
+        assert_eq!(heap.shows(2, &backing), Some(true));
+
+        let mut updated = resource;
+        updated[1] = 0xabcd;
+        updated[13] = 0x1234;
+        desc[4] = 0;
+        desc[5] = 2;
+        mirror(&View::Placed(false, updated, desc), false);
+        assert_eq!(heap.shows(2, &backing), Some(true));
+
+        // A resource with a different width must not keep the old slot.
+        updated[4] *= 2;
+        mirror(&View::Placed(false, updated, desc), false);
+        assert_eq!(heap.shows(2, &backing), None);
     }
 
     #[test]
